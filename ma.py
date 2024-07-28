@@ -26,29 +26,57 @@ def moving_average(df, ma_period):
     df['MA'] = df['Adj Close'].rolling(window=ma_period).mean()
     return df
 
-def strategy(df, ma_period):
+def trading_strategy(df, ma_period):
     df['MA'] = df['Adj Close'].rolling(window=ma_period).mean()
-    df['Signal'] = np.where(df['Adj Close'] > df['MA'], 1, -1)
+    
+    initial_cash = 100000
+    cash = initial_cash
+    position = 0
+    buy_returns = 0
+    sell_returns = 0
 
-    df['Prev Signal'] = df['Signal'].shift(1)
-    df['Position'] = np.where(df['Signal'] != df['Prev Signal'], df['Signal'], np.nan)
-    df['Position'] = df['Position'].ffill().fillna(0)
+    for i in range(ma_period, len(df)):
+        lastClosedMA = df['MA'].iloc[i-1]
+        lastClosed2MA = df['MA'].iloc[i-2]
+        lastClosedPrice = df['Adj Close'].iloc[i-1]
+        lastClosed2Price = df['Adj Close'].iloc[i-2]
+        current_price = df['Adj Close'].iloc[i]
 
-    df['Returns'] = df['Adj Close'].pct_change()
-    df['Strategy Returns'] = df['Position'].shift(1) * df['Returns']
+        if lastClosed2Price <= lastClosed2MA and lastClosedPrice > lastClosedMA:
+            # Price crossed above MA, open a buy position
+            if position <= 0:
+                cash += position * current_price  # Close any short position
+                position = cash / current_price
+                cash = 0
 
-    df['Buy Returns'] = np.where(df['Position'].shift(1) == 1, df['Strategy Returns'], 0)
-    df['Sell Returns'] = np.where(df['Position'].shift(1) == -1, df['Strategy Returns'], 0)
+        elif lastClosed2Price >= lastClosed2MA and lastClosedPrice < lastClosedMA:
+            # Price crossed below MA, close buy position and open a sell position
+            if position > 0:
+                cash += position * current_price
+                buy_returns += cash - initial_cash
+                position = -cash / current_price
+                cash = 0
+        
+        elif lastClosedPrice < lastClosedMA and current_price > lastClosedMA:
+            # Close sell position
+            if position < 0:
+                cash += -position * current_price
+                sell_returns += cash - initial_cash
+                position = 0
 
-    total_buy_returns = df['Buy Returns'].sum()
-    total_sell_returns = df['Sell Returns'].sum()
+    # Closing any open position at the end
+    if position > 0:
+        cash += position * df['Adj Close'].iloc[-1]
+        buy_returns += cash - initial_cash
+    elif position < 0:
+        cash += -position * df['Adj Close'].iloc[-1]
+        sell_returns += cash - initial_cash
 
-    return total_buy_returns, total_sell_returns
+    return buy_returns, sell_returns
 
 def evaluate(individual):
     ma_period = individual[0]
-    df_with_ma = moving_average(df.copy(), ma_period)
-    total_buy_returns, total_sell_returns = strategy(df_with_ma, ma_period)
+    total_buy_returns, total_sell_returns = trading_strategy(df.copy(), ma_period)
     return total_buy_returns, total_sell_returns
 
 creator.create("FitnessMulti", base.Fitness, weights=(1.0, 1.0))  # Maximize both buy and sell returns
@@ -66,8 +94,8 @@ toolbox.register("evaluate", evaluate)
 
 NGEN = 50
 CXPB = 0.9
-MUTPB = 0.9
-population = toolbox.population(n=1000)
+MUTPB = 0.5
+population = toolbox.population(n=500)
 
 def evolve_population(population, toolbox, cxpb=CXPB, mutpb=MUTPB, ngen=NGEN):
     stats = tools.Statistics(lambda ind: ind.fitness.values)
