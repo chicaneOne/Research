@@ -1,6 +1,7 @@
 import random
 import numpy as np
 import pandas as pd
+import keyboard
 import yfinance as yf
 from deap import base, creator, tools, algorithms
 import matplotlib.pyplot as plt
@@ -9,11 +10,17 @@ timeframe = '1h'
 ticker = 'GLD'
 df = yf.download(tickers=ticker, period='1y', interval=timeframe)
 
+def generate_erc():
+    return random.uniform(0,1)
+
 def custom_mutate(individual, indpb=0.2):
     size = len(individual)
     for i in range(size):
         if random.random() < indpb:
-            individual[i] = random.randint(10, 30)
+            if i == 0:
+                individual[i] = random.randint(10, 30)
+            else:
+                individual[i] = random.uniform(max(0, individual[i] - 0.1), min(1, individual[i] + 0.1))
     return individual,
 
 def hybrid_selection(population, size):
@@ -21,51 +28,86 @@ def hybrid_selection(population, size):
     final_population = toolbox.selectNSGA2(intermediate_population, size)
     return final_population
 
-def moving_average(df, ma_period):
-    df['MA'] = df['Adj Close'].rolling(window=ma_period).mean()
-    return df
+def risk_adjusted_return(trades, risk_free_rate=0.02):
+    if len(trades) == 0:
+        return 0
+    excess_returns = np.array(trades) - risk_free_rate / (252 * 6)
+    downside_returns = excess_returns[excess_returns < 0]
+    std_dev_downside = np.std(downside_returns)
+    if std_dev_downside == 0:
+        return 0
+    return np.mean(excess_returns) / std_dev_downside
 
-def strategy(df, ma_period):
-    df['MA'] = df['Adj Close'].rolling(window=ma_period).mean()
-    df['Signal'] = np.where(df['Adj Close'] > df['MA'], 1, -1)
 
-    df['Prev Signal'] = df['Signal'].shift(1)
-    df['Position'] = np.where(df['Signal'] != df['Prev Signal'], df['Signal'], np.nan)
-    df['Position'] = df['Position'].ffill().fillna(0)
+def rsi_calculation(data, period):
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
 
-    df['Returns'] = df['Adj Close'].pct_change()
-    df['Strategy Returns'] = df['Position'].shift(1) * df['Returns']
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
-    df['Positive Returns'] = np.where(df['Strategy Returns'] > 0, df['Strategy Returns'], 0)
-    df['Negative Returns'] = np.where(df['Strategy Returns'] < 0, df['Strategy Returns'], 0)
+def trading_simulation(individual):
+    rsi_period, erc_tp, erc_sl = individual
+    local_df = df.copy()
+    local_df['RSI'] = rsi_calculation(local_df['Adj Close'], rsi_period)
+    
+    trades = []
+    position_open_price = []
+    positionLimit = 3
 
-    total_positive_returns = df['Positive Returns'].sum()
-    total_negative_returns = df['Negative Returns'].sum()
+    for i in range(2, len(local_df)):
+        lastClosedRSI = local_df['RSI'].iloc[i-1]
+        lastClosed2RSI = local_df['RSI'].iloc[i-2]
+        current_price = local_df['Adj Close'].iloc[i]
 
-    return total_positive_returns, total_negative_returns
+        new_positions_open_price = []
+        for price in position_open_price:
+            trade_return = (current_price - price) / price
+            if lastClosedRSI >= 70 or trade_return >= erc_tp / 100:
+                trades.append(trade_return)
+            elif trade_return <= -erc_sl / 100:
+                trades.append(trade_return)
+            else:
+                new_positions_open_price.append(price)
+        position_open_price = new_positions_open_price
+
+        if lastClosed2RSI > 30 and lastClosedRSI <= 30 and len(position_open_price) < positionLimit:
+            position_open_price.append(current_price)
+
+    for price in position_open_price:
+        trade_return = (current_price - price) / price
+        trades.append(trade_return)
+
+    equity_curve = np.cumsum(trades)
+    return trades, equity_curve
 
 def evaluate(individual):
-    ma_period = individual[0]
-    df_with_ma = moving_average(df.copy(), ma_period)
-    total_positive_returns, total_negative_returns = strategy(df_with_ma, ma_period)
-    return total_positive_returns, total_negative_returns
+    trades, equity_curve = trading_simulation(individual)
+    cumulative_return = np.sum(trades)
+    risk_adj_ret = risk_adjusted_return(trades)
+    
+    return cumulative_return, risk_adj_ret
 
-creator.create("FitnessMulti", base.Fitness, weights=(1.0, 1.0))  # Maximize both positive and negative returns
+creator.create("FitnessMulti", base.Fitness, weights=(1.0, 1.0))
 creator.create("Individual", list, fitness=creator.FitnessMulti)
 
 toolbox = base.Toolbox()
 toolbox.register("attr_int", random.randint, 10, 30)
-toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_int, 1)
+toolbox.register("attr_take_profit", generate_erc)
+toolbox.register("attr_stop_loss", generate_erc)
+toolbox.register("individual", tools.initCycle, creator.Individual, (toolbox.attr_int, toolbox.attr_take_profit, toolbox.attr_stop_loss), n=1)
 toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-toolbox.register("mate", tools.cxUniform, indpb=0.5)
+toolbox.register("mate", tools.cxTwoPoint)
 toolbox.register("mutate", custom_mutate)
 toolbox.register("selectTournament", tools.selTournament, tournsize=3)
 toolbox.register("selectNSGA2", tools.selNSGA2)
 toolbox.register("evaluate", evaluate)
 
 NGEN = 50
-CXPB = 0.9
-MUTPB = 0.2
+CXPB = 0.95
+MUTPB = 0.5
 population = toolbox.population(n=500)
 
 def evolve_population(population, toolbox, cxpb=CXPB, mutpb=MUTPB, ngen=NGEN):
@@ -111,46 +153,52 @@ def evolve_population(population, toolbox, cxpb=CXPB, mutpb=MUTPB, ngen=NGEN):
         
         print(logbook.stream)
         best_ind = tools.selBest(population, 1)[0]
-        print(f"Gen {gen}: MA Period: {best_ind[0]}, Positive Returns: {best_ind.fitness.values[0]*100:.2f}%, Negative Returns: {best_ind.fitness.values[1]*100:.2f}%")
+        print(f"Gen {gen}: RSI Period: {best_ind[0]}, Take-Profit: {best_ind[1]:.2f}%, Stop-Loss: {best_ind[2]:.2f}%")
 
     return population, logbook
 
 population, logbook = evolve_population(population, toolbox, cxpb=CXPB, mutpb=MUTPB, ngen=NGEN)
 
 best_individual = tools.selBest(population, 1)[0]
-ma_period = best_individual[0]
-print(f"Best individual for {timeframe} timeframe:\n MA Period: {ma_period}\n Positive Returns: {best_individual.fitness.values[0]*100:.2f}%, Negative Returns: {best_individual.fitness.values[1]*100:.2f}")
+rsi_period, erc_tp, erc_sl = best_individual
+print(f"Best individual for {timeframe} timeframe:\n RSI Period: {rsi_period}\n Take-Profit Percentage: {erc_tp:.2f}%\n Stop-Loss Percentage: {erc_sl:.2f}%\n Fitness: {best_individual.fitness.values[0]*100:.2f}%, {best_individual.fitness.values[1]:.2f}")
 
-# Plotting (optional)
-# generations = range(1, len(logbook) + 1)
-# avg_positive_returns = [log['avg'][0] for log in logbook]
-# avg_negative_returns = [log['avg'][1] for log in logbook]
-# max_positive_returns = [log['max'][0] for log in logbook]
-# max_negative_returns = [log['max'][1] for log in logbook]
-# fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-# axs[0, 0].plot(generations, avg_positive_returns, label='Average Positive Returns', color='blue')
-# axs[0, 0].set_title('Average Positive Returns Over Generations')
-# axs[0, 0].set_xlabel('Generation')
-# axs[0, 0].set_ylabel('Average Fitness Value')
-# axs[0, 0].legend()
-# axs[0, 0].grid(True)
-# axs[0, 1].plot(generations, avg_negative_returns, label='Average Negative Returns', color='green')
-# axs[0, 1].set_title('Average Negative Returns Over Generations')
-# axs[0, 1].set_xlabel('Generation')
-# axs[0, 1].set_ylabel('Average Fitness Value')
-# axs[0, 1].legend()
-# axs[0, 1].grid(True)
-# axs[1, 0].plot(generations, max_positive_returns, label='Max Positive Returns', color='red')
-# axs[1, 0].set_title('Max Positive Returns Over Generations')
-# axs[1, 0].set_xlabel('Generation')
-# axs[1, 0].set_ylabel('Maximum Fitness Value')
-# axs[1, 0].legend()
-# axs[1, 0].grid(True)
-# axs[1, 1].plot(generations, max_negative_returns, label='Max Negative Returns', color='orange')
-# axs[1, 1].set_title('Max Negative Returns Over Generations')
-# axs[1, 1].set_xlabel('Generation')
-# axs[1, 1].set_ylabel('Maximum Fitness Value')
-# axs[1, 1].legend()
-# axs[1, 1].grid(True)
-# plt.tight_layout()
-# plt.show()
+generations = range(1, len(logbook) + 1)
+
+avg_cumulative_returns = [log['avg'][0] for log in logbook]
+avg_risk_adjusted_returns = [log['avg'][1] for log in logbook]
+max_cumulative_returns = [log['max'][0] for log in logbook]
+max_risk_adjusted_returns = [log['max'][1] for log in logbook]
+
+fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+
+axs[0, 0].plot(generations, avg_cumulative_returns, label='Average Cumulative Return', color='blue')
+axs[0, 0].set_title('Average Cumulative Return Over Generations')
+axs[0, 0].set_xlabel('Generation')
+axs[0, 0].set_ylabel('Average Fitness Value')
+axs[0, 0].legend()
+axs[0, 0].grid(True)
+
+axs[0, 1].plot(generations, avg_risk_adjusted_returns, label='Average Risk-Adjusted Return', color='green')
+axs[0, 1].set_title('Average Risk-Adjusted Return Over Generations')
+axs[0, 1].set_xlabel('Generation')
+axs[0, 1].set_ylabel('Average Fitness Value')
+axs[0, 1].legend()
+axs[0, 1].grid(True)
+
+axs[1, 0].plot(generations, max_cumulative_returns, label='Max Cumulative Return', color='red')
+axs[1, 0].set_title('Max Cumulative Return Over Generations')
+axs[1, 0].set_xlabel('Generation')
+axs[1, 0].set_ylabel('Maximum Fitness Value')
+axs[1, 0].legend()
+axs[1, 0].grid(True)
+
+axs[1, 1].plot(generations, max_risk_adjusted_returns, label='Max Risk-Adjusted Return', color='orange')
+axs[1, 1].set_title('Max Risk-Adjusted Return Over Generations')
+axs[1, 1].set_xlabel('Generation')
+axs[1, 1].set_ylabel('Maximum Fitness Value')
+axs[1, 1].legend()
+axs[1, 1].grid(True)
+
+plt.tight_layout()
+plt.show()
