@@ -1,7 +1,9 @@
 # Multi-Objective Optimization and Genetic Programming of Technical Indicators for Trading
 
 **Objective** : Maximal return and minimal risk
+
 **Dataset** : Gold/XAUUSD 1H
+
 **Genetic Algorithm** : initialize population, then each individual undergoes selection, crossover, and mutation processes.
 
 **PARAMETERS OF THE GP ALGORITHM**
